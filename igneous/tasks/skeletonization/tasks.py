@@ -20,6 +20,7 @@ import edt # euclidean distance transform
 from taskqueue import RegisteredTask
 
 from igneous import chunks, downsample, downsample_scales
+import fastremap
 
 from .definitions import Skeleton
 from .skeletonization import TEASAR
@@ -60,46 +61,87 @@ class SkeletonTask(RegisteredTask):
 
     all_labels = vol[ bbox.to_slices() ]
     all_labels = all_labels[:,:,:,0]
+    all_labels, remap = fastremap.renumber(all_labels)
+    iremap = { v:k for k,v in remap.items() }
 
     path = skeldir(self.cloudpath)
     path = os.path.join(self.cloudpath, path)
 
-    print("MLAEDT3D")
     all_dbf = edt.edt(all_labels, anisotropy=vol.resolution.tolist())
     print("EDT Done.")
 
-    with Storage(path) as stor:
-      for segid in np.unique(all_labels):
-        if segid == 0:
-          continue 
+    # for segid in np.unique(all_labels):
+    for segid in (remap[28823174],):
+      self.process_label(segid, iremap, all_labels, all_dbf, bbox)
 
-        print(segid)
-        # Crop DBF to ROI
-        labels = (all_labels == segid)
-        slices = scipy.ndimage.find_objects(labels)[0]
-        dbf = labels[slices] * all_dbf[slices]
-        del labels
+  def process_label(self, segid, remap, all_labels, all_dbf, bbox):
+    if remap[segid] == 0:
+      return
 
-        roi = Bbox.from_slices(slices)
-        roi += bbox.minpt 
+    print(remap[segid])
+    skeletons = []
+    for dbf, roi in self.components(segid, all_labels, all_dbf, bbox):
+      print(roi)
+      # save_images(dbf)
+      skeleton = self.skeletonize(dbf, roi)
+      if not skeleton.empty():
+        skeletons.append(skeleton)
+      break
 
-        skeleton = self.skeletonize(dbf, roi)
+    num_skels = len(skeletons)
 
-        print(skeleton)
-        
-        if skeleton.empty():
-          continue
+    print(num_skels)
 
-        if self.will_postprocess:
-          stor.put_file(
-            file_path="{}:skel:{}".format(segid, bbox.to_filename()),
-            content=pickle.dumps(skeleton),
-            compress='gzip',
-            content_type="application/python-pickle",
-          )
-        else:
-          skeleton.nodes[:] *= vol.resolution
-          vol.skeleton.upload(segid, skeleton.nodes, skeleton.edges, skeleton.radii)
+    if num_skels == 0:
+      print("no skels")
+      return
+
+    skeleton = skeletons[0]
+    num_vertices = skeleton.nodes.shape[0]
+    for i in range(1, num_skels):
+      skeleton.nodes = np.concatenate(skeleton.nodes, skeletons[i].nodes)
+      edges = skeletons[i].edges + num_vertices
+      skeleton.edges = np.concatenate(skeleton.edges, edges)
+      skeleton.radii = np.concatenate(skeleton.radii, skeletons[i].radii)
+    
+    # if self.will_postprocess:
+    #   stor.put_file(
+    #     file_path="{}:skel:{}".format(segid, bbox.to_filename()),
+    #     content=pickle.dumps(skeleton),
+    #     compress='gzip',
+    #     content_type="application/python-pickle",
+    #   )
+    # else:
+    skeleton.nodes[:] *= vol.resolution
+    print(remap[segid])
+    print(skeleton)
+    vol.skeleton.upload(remap[segid], skeleton.nodes, skeleton.edges, skeleton.radii)    
+
+  def components(self, segid, all_labels, all_dbf, bbox):
+    labels = (all_labels == segid)
+    labels, N = scipy.ndimage.measurements.label(labels)
+    labels = labels.astype(np.uint8)
+    labels = np.copy(labels, order='F')
+
+    for i in range(1, N):
+      component = (labels == i)
+
+      save_images(component, directory='./saved_images/component/')
+
+      slices = scipy.ndimage.find_objects(component)[0]
+      roi = Bbox.from_slices(slices)
+
+      if roi.volume() <= 1:
+        continue
+
+      dbf = component[slices] * all_dbf[slices]
+      save_images(component[slices])
+      save_images(all_dbf[slices], directory='./saved_images/alldbf/')
+      del component
+
+      roi += bbox.minpt 
+      
+      yield dbf, roi
 
   def skeletonize(self, dbf, bbox):
     skeleton = TEASAR(dbf, self.teasar_params)
