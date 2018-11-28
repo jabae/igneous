@@ -19,6 +19,7 @@ git clone git@github.com:seung-lab/igneous.git
 cd igneous
 virtualenv venv
 source venv/bin/activate
+pip install numpy
 pip install -e .
 ```
 
